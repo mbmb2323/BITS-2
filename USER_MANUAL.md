@@ -2,17 +2,19 @@
 
 ## Command reference
 ```bash
-python /home/runner/work/BITS-2/BITS-2/mbmb2323/BITS-2/trading_platform.py analyze <csv_path> [--symbol TICKER] [--min-avg-volume N] [--min-price N] [--top-n N]
-python /home/runner/work/BITS-2/BITS-2/mbmb2323/BITS-2/trading_platform.py assemble --scan-root <repo_root> [--repo-name-contains NAME] [--max-components-per-repo N] [--output FILE]
-python /home/runner/work/BITS-2/BITS-2/mbmb2323/BITS-2/trading_platform.py daily-report <csv_path> [--symbol TICKER] [--scan-root <repo_root>] [--repo-name-contains NAME] [--output FILE]
+python trading_platform.py analyze <csv_path> [--symbol TICKER] [--min-avg-volume N] [--min-price N] [--top-n N]
+python trading_platform.py assemble --scan-root <repo_root> [--repo-name-contains NAME] [--max-components-per-repo N] [--output FILE]
+python trading_platform.py daily-report <csv_path> [--symbol TICKER] [--scan-root <repo_root>] [--repo-name-contains NAME] [--output FILE]
 ```
 
 ## Analyze output
 JSON payload containing:
 - `screen`: ranked symbols
+- `ensemble`: selected-symbol 7-engine snapshot blending ML and technical analysis
 - `allocations`: normalized target weights
 - `symbol`: selected symbol for the model/backtest
 - `backtest`: KPI summary when enough history exists
+- `execution_plan`: entry, sizing, and risk rules tied to ensemble probability
 - `daily_plan`: repeatable operating checklist
 - `error`: included when data is insufficient
 

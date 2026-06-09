@@ -90,6 +90,23 @@ def _daily_returns(prices: Sequence[float]) -> List[float]:
     return [(prices[i] / prices[i - 1]) - 1.0 for i in range(1, len(prices)) if prices[i - 1] > 0]
 
 
+def _clamp_probability(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _feature_vector(rows: Sequence[PriceRow], index: int, lookback: int = 5) -> List[float] | None:
+    if index < lookback or index >= len(rows):
+        return None
+    closes = [r.close for r in rows]
+    volumes = [r.volume for r in rows]
+    daily = _daily_returns(closes[index - lookback : index + 1])
+    avg_ret = mean(daily)
+    vol = pstdev(daily) if len(daily) > 1 else 0.0
+    momentum = (closes[index] / closes[index - lookback]) - 1.0
+    vol_spike = volumes[index] / max(1.0, mean(volumes[index - lookback : index]))
+    return [avg_ret, vol, momentum, vol_spike]
+
+
 def screen_symbols(
     grouped: Dict[str, List[PriceRow]],
     min_avg_volume: float = 100_000,
@@ -113,7 +130,14 @@ def screen_symbols(
         annual_vol = (pstdev(rets) if len(rets) > 1 else 0.0) * math.sqrt(252)
         sharpe = annual_ret / annual_vol if annual_vol > 0 else 0.0
         momentum = (closes[-1] / closes[-21]) - 1.0
-        score = (0.45 * sharpe) + (0.35 * annual_ret) + (0.20 * momentum)
+        ensemble = build_latest_ensemble_snapshot(rows)
+        score = (
+            (0.45 * sharpe)
+            + (0.35 * annual_ret)
+            + (0.20 * momentum)
+            + (0.20 * (ensemble["ensemble_probability"] - 0.5))
+            + (0.10 * (ensemble["technical_probability"] - 0.5))
+        )
         rankings.append(
             {
                 "symbol": symbol,
@@ -124,6 +148,10 @@ def screen_symbols(
                 "momentum_1m": momentum,
                 "avg_volume_20d": avg_volume,
                 "last_price": latest,
+                "ml_probability": ensemble["ml_probability"],
+                "technical_probability": ensemble["technical_probability"],
+                "ensemble_probability": ensemble["ensemble_probability"],
+                "ensemble_stance": ensemble["stance"],
             }
         )
     rankings.sort(key=lambda x: x["score"], reverse=True)
@@ -134,16 +162,13 @@ def build_features(rows: Sequence[PriceRow], lookback: int = 5) -> tuple[List[Li
     if len(rows) <= lookback + 1:
         return [], []
     closes = [r.close for r in rows]
-    volumes = [r.volume for r in rows]
     X: List[List[float]] = []
     y: List[int] = []
     for i in range(lookback, len(rows) - 1):
-        daily = _daily_returns(closes[i - lookback : i + 1])
-        avg_ret = mean(daily)
-        vol = pstdev(daily) if len(daily) > 1 else 0.0
-        momentum = (closes[i] / closes[i - lookback]) - 1.0
-        vol_spike = volumes[i] / max(1.0, mean(volumes[i - lookback : i]))
-        X.append([avg_ret, vol, momentum, vol_spike])
+        feature_vector = _feature_vector(rows, i, lookback=lookback)
+        if feature_vector is None:
+            continue
+        X.append(feature_vector)
         y.append(1 if closes[i + 1] > closes[i] else 0)
     return X, y
 
@@ -195,6 +220,98 @@ class LogisticSignalModel:
             raise ValueError("Model is not fitted")
         Xn = self._standardize(X, fit=False)
         return [self._sigmoid(sum(w * x for w, x in zip(self._weights, row)) + self._bias) for row in Xn]
+
+
+def _technical_engine_scores(rows: Sequence[PriceRow], index: int) -> Dict[str, float]:
+    closes = [r.close for r in rows]
+    volumes = [r.volume for r in rows]
+    if not closes or index >= len(closes):
+        return {}
+
+    short_window = closes[max(0, index - 4) : index + 1]
+    medium_window = closes[max(0, index - 9) : index + 1]
+    long_window = closes[max(0, index - 19) : index + 1]
+    current_close = closes[index]
+    prior_close = closes[max(0, index - 10)]
+    prior_range = long_window[:-1] or long_window
+    prior_high = max(prior_range) if prior_range else current_close
+    prior_low = min(prior_range) if prior_range else current_close
+    prior_volumes = volumes[max(0, index - 5) : index] or [volumes[index]]
+    volume_ratio = volumes[index] / max(1.0, mean(prior_volumes))
+    recent_returns = _daily_returns(long_window)
+
+    trend = 0.5
+    long_mean = mean(long_window) if long_window else 0.0
+    if short_window and long_mean > 0:
+        trend = _clamp_probability(0.5 + (((mean(short_window) / long_mean) - 1.0) * 8.0))
+
+    momentum = 0.5
+    if prior_close > 0:
+        momentum = _clamp_probability(0.5 + (((current_close / prior_close) - 1.0) * 6.0))
+
+    breakout = 0.5
+    if prior_high > prior_low:
+        breakout = _clamp_probability((current_close - prior_low) / (prior_high - prior_low))
+
+    mean_reversion = 0.5
+    if current_close > 0 and medium_window:
+        mean_reversion = _clamp_probability(0.5 + (((mean(medium_window) / current_close) - 1.0) * 4.0))
+
+    volume_confirmation = _clamp_probability(0.5 + ((volume_ratio - 1.0) * 0.3))
+
+    volatility = pstdev(recent_returns) if len(recent_returns) > 1 else 0.0
+    volatility_regime = _clamp_probability(0.5 + ((0.025 - volatility) * 10.0))
+
+    return {
+        "trend": trend,
+        "momentum": momentum,
+        "breakout": breakout,
+        "mean_reversion": mean_reversion,
+        "volume_confirmation": volume_confirmation,
+        "volatility_regime": volatility_regime,
+    }
+
+
+def build_ensemble_snapshot(rows: Sequence[PriceRow], index: int, ml_probability: float) -> dict:
+    ml_probability = _clamp_probability(ml_probability)
+    technical_scores = _technical_engine_scores(rows, index)
+    technical_probability = mean(technical_scores.values()) if technical_scores else ml_probability
+    engine_scores = {"ml_logistic": ml_probability, **technical_scores}
+    ensemble_probability = mean(engine_scores.values())
+    strongest_signals = [
+        name
+        for name, _ in sorted(
+            technical_scores.items(),
+            key=lambda item: abs(item[1] - 0.5),
+            reverse=True,
+        )[:3]
+    ]
+    if ensemble_probability >= 0.6:
+        stance = "long bias"
+    elif ensemble_probability >= 0.53:
+        stance = "watchlist"
+    else:
+        stance = "defensive"
+    return {
+        "engine_count": len(engine_scores),
+        "ml_probability": round(ml_probability, 4),
+        "technical_probability": round(technical_probability, 4),
+        "ensemble_probability": round(ensemble_probability, 4),
+        "engines": {name: round(score, 4) for name, score in engine_scores.items()},
+        "strongest_signals": strongest_signals,
+        "stance": stance,
+    }
+
+
+def build_latest_ensemble_snapshot(rows: Sequence[PriceRow]) -> dict:
+    feature_vector = _feature_vector(rows, len(rows) - 1)
+    ml_probability = 0.5
+    X, y = build_features(rows)
+    if feature_vector and len(X) >= 10:
+        model = LogisticSignalModel(epochs=300)
+        model.fit(X, y)
+        ml_probability = model.predict_proba([feature_vector])[0]
+    return build_ensemble_snapshot(rows, len(rows) - 1, ml_probability)
 
 
 def backtest_long_only(
@@ -258,7 +375,12 @@ def recommend_allocations(rankings: Sequence[dict], max_names: int = 5) -> List[
     raw_scores = []
     for item in selected:
         risk = max(item["annual_volatility"], 0.01)
-        reward = max(item["annual_return"], 0.0) + max(item["momentum_1m"], 0.0) + 0.01
+        reward = (
+            max(item["annual_return"], 0.0)
+            + max(item["momentum_1m"], 0.0)
+            + max(item.get("ensemble_probability", 0.5) - 0.5, 0.0)
+            + 0.01
+        )
         raw_scores.append(reward / risk)
     total = sum(raw_scores) or float(len(raw_scores))
     allocations = []
@@ -275,9 +397,43 @@ def recommend_allocations(rankings: Sequence[dict], max_names: int = 5) -> List[
     return allocations
 
 
-def build_daily_investment_plan(rankings: Sequence[dict], allocations: Sequence[dict], target_symbol: str | None) -> dict:
+def build_execution_plan(target_symbol: str | None, allocation: dict | None, ensemble: dict | None) -> dict:
+    ensemble = ensemble or {}
+    ml_probability = float(ensemble.get("ml_probability", 0.5))
+    technical_probability = float(ensemble.get("technical_probability", 0.5))
+    ensemble_probability = float(ensemble.get("ensemble_probability", 0.5))
+    if ensemble_probability >= 0.6 and technical_probability >= 0.55:
+        action = "build long exposure"
+    elif ensemble_probability >= 0.53:
+        action = "watch for confirmation"
+    else:
+        action = "stand aside"
+    target_weight_pct = allocation.get("target_weight_pct") if allocation else None
+    weight_text = f"{target_weight_pct}%" if target_weight_pct is not None else "watchlist size"
+    return {
+        "symbol": target_symbol or "watchlist candidate",
+        "action": action,
+        "ml_probability": round(ml_probability, 4),
+        "technical_probability": round(technical_probability, 4),
+        "ensemble_probability": round(ensemble_probability, 4),
+        "target_weight_pct": target_weight_pct,
+        "entry_rule": "Only enter when ML probability and technical confirmation both clear 0.55.",
+        "sizing_rule": f"Size to roughly {weight_text} while the ensemble bias remains constructive.",
+        "risk_rule": "Cut risk if the ensemble falls back below 0.50 or price loses trend support.",
+    }
+
+
+def build_daily_investment_plan(
+    rankings: Sequence[dict],
+    allocations: Sequence[dict],
+    target_symbol: str | None,
+    execution_plan: dict | None = None,
+) -> dict:
     candidates = [item["symbol"] for item in rankings[:3]]
     focus_names = [item["symbol"] for item in allocations[:3]]
+    execution_plan = execution_plan or {}
+    ml_probability = execution_plan.get("ml_probability", 0.5)
+    technical_probability = execution_plan.get("technical_probability", 0.5)
     plan = {
         "pre_market": [
             f"Review top screened symbols: {', '.join(candidates) or 'none'}.",
@@ -285,12 +441,15 @@ def build_daily_investment_plan(rankings: Sequence[dict], allocations: Sequence[
             f"Confirm target allocations: {', '.join(focus_names) or 'none'}.",
         ],
         "market_hours": [
-            f"Monitor ML signal and price action for {target_symbol or 'the selected symbol' }.",
-            "Only take long exposure when the model probability clears the confidence threshold.",
+            (
+                f"Monitor ML ({ml_probability:.0%}) and technical ({technical_probability:.0%}) alignment "
+                f"for {target_symbol or 'the selected symbol'}."
+            ),
+            f"Use the execution stance to {execution_plan.get('action', 'wait for confirmation')}.",
             "Track realized drawdown versus plan before adding risk.",
         ],
         "post_market": [
-            "Re-run the backtest on refreshed data.",
+            "Re-run the ensemble backtest on refreshed data.",
             "Compare KPI drift versus prior day output.",
             "Adjust thresholds only after reviewing risk-adjusted performance.",
         ],
@@ -311,17 +470,23 @@ def run_pipeline(
     allocations = recommend_allocations(rankings)
 
     target_symbol = symbol or (rankings[0]["symbol"] if rankings else None)
+    target_allocation = next((item for item in allocations if item["symbol"] == target_symbol), None)
     result = {
         "screen": rankings,
         "allocations": allocations,
         "symbol": target_symbol,
-        "daily_plan": build_daily_investment_plan(rankings, allocations, target_symbol),
     }
     if not target_symbol or target_symbol not in grouped:
+        result["execution_plan"] = build_execution_plan(target_symbol, target_allocation, None)
+        result["daily_plan"] = build_daily_investment_plan(rankings, allocations, target_symbol, result["execution_plan"])
         result["error"] = "No symbol available for model/backtest"
         return result
 
     series = grouped[target_symbol]
+    latest_ensemble = build_latest_ensemble_snapshot(series)
+    result["ensemble"] = latest_ensemble
+    result["execution_plan"] = build_execution_plan(target_symbol, target_allocation, latest_ensemble)
+    result["daily_plan"] = build_daily_investment_plan(rankings, allocations, target_symbol, result["execution_plan"])
     X, y = build_features(series)
     if len(X) < 30:
         result["error"] = "Not enough data for model"
@@ -336,8 +501,13 @@ def run_pipeline(
     model = LogisticSignalModel()
     model.fit(X_train, y_train)
     probs = model.predict_proba(X_test)
-    rows_for_backtest = series[-(len(probs) + 1) :]
-    bt = backtest_long_only(rows_for_backtest, probs)
+    first_test_index = len(series) - len(probs) - 1
+    ensemble_probs = [
+        build_ensemble_snapshot(series, first_test_index + offset, ml_probability)["ensemble_probability"]
+        for offset, ml_probability in enumerate(probs)
+    ]
+    rows_for_backtest = series[-(len(ensemble_probs) + 1) :]
+    bt = backtest_long_only(rows_for_backtest, ensemble_probs)
 
     result["backtest"] = {
         "total_return_pct": bt.total_return_pct,

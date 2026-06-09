@@ -1,4 +1,5 @@
 import json
+import csv
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -13,6 +14,7 @@ from trading_platform import (
     group_by_symbol,
     recommend_allocations,
     render_assembly_markdown,
+    run_pipeline,
     screen_symbols,
 )
 
@@ -25,6 +27,17 @@ class TradingPlatformTests(unittest.TestCase):
         for i in range(n):
             price *= 1 + growth
             rows.append(PriceRow(date=base + timedelta(days=i), symbol=symbol, close=price, volume=200000 + i * 100))
+        return rows
+
+    def _strategy_rows(self, symbol: str, start_price: float, n: int = 90, tilt: float = 0.0):
+        base = datetime(2024, 1, 1)
+        rows = []
+        price = start_price
+        for i in range(n):
+            cycle = (i % 6) - 2
+            growth = 0.0025 + tilt + (cycle * 0.0004)
+            price *= 1 + growth
+            rows.append(PriceRow(date=base + timedelta(days=i), symbol=symbol, close=price, volume=220000 + (i % 8) * 3500))
         return rows
 
     def test_screening_ranks_stronger_symbol_higher(self):
@@ -74,6 +87,32 @@ class TradingPlatformTests(unittest.TestCase):
             markdown = render_assembly_markdown(report)
             self.assertIn("Repository Assembly Report", markdown)
             json.dumps(report)
+
+    def test_pipeline_builds_seven_engine_ensemble_and_execution_plan(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = Path(tmpdir) / "prices.csv"
+            rows = self._strategy_rows("AAA", 40, tilt=0.0008) + self._strategy_rows("BBB", 40, tilt=0.0)
+            with csv_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["date", "symbol", "close", "volume"])
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(
+                        {
+                            "date": row.date.isoformat(),
+                            "symbol": row.symbol,
+                            "close": row.close,
+                            "volume": row.volume,
+                        }
+                    )
+
+            result = run_pipeline(str(csv_path), symbol="AAA", top_n=2)
+            self.assertEqual(result["ensemble"]["engine_count"], 7)
+            self.assertTrue(0.0 <= result["ensemble"]["ml_probability"] <= 1.0)
+            self.assertTrue(0.0 <= result["ensemble"]["technical_probability"] <= 1.0)
+            self.assertTrue(0.0 <= result["ensemble"]["ensemble_probability"] <= 1.0)
+            self.assertIn("entry_rule", result["execution_plan"])
+            self.assertEqual(result["execution_plan"]["symbol"], "AAA")
+            self.assertIn("ensemble_probability", result["screen"][0])
 
 
 if __name__ == "__main__":
