@@ -27,4 +27,6 @@ CSV schema required:
 - `close`
 - `volume`
 
-See `USER_GUIDE.md` and `USER_MANUAL.md`.
+## Documentation
+- `USER_GUIDE.md`: step-by-step daily workflow and examples
+- `USER_MANUAL.md`: complete command/options/output reference
