@@ -46,6 +46,27 @@ class TradingPlatformTests(unittest.TestCase):
         self.assertEqual(ranked[0]["symbol"], "AAA")
         self.assertEqual(len(ranked), 2)
 
+    def test_screening_parallel_path_matches_sequential_ranking(self):
+        rows = (
+            self._rows("AAA", 50, 0.004)
+            + self._rows("BBB", 50, 0.003)
+            + self._rows("CCC", 50, 0.002)
+            + self._rows("DDD", 50, 0.001)
+        )
+        grouped = group_by_symbol(rows)
+
+        sequential = screen_symbols(grouped, top_n=4, workers=1)
+        parallel = screen_symbols(grouped, top_n=4, workers=2)
+
+        self.assertEqual([item["symbol"] for item in parallel], [item["symbol"] for item in sequential])
+        for parallel_item, sequential_item in zip(parallel, sequential):
+            self.assertAlmostEqual(parallel_item["score"], sequential_item["score"])
+
+    def test_screening_rejects_invalid_worker_count(self):
+        rows = self._rows("AAA", 50, 0.004) + self._rows("BBB", 50, 0.001)
+        with self.assertRaisesRegex(ValueError, "workers must be None or at least 1"):
+            screen_symbols(group_by_symbol(rows), workers=0)
+
     def test_model_produces_probabilities(self):
         rows = self._rows("AAA", 25, 0.003, n=70)
         X, y = build_features(rows)
