@@ -4,12 +4,24 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from statistics import mean, pstdev
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence
+
+try:
+    import numpy as np
+    _HAS_NUMPY = True
+except ImportError:  # pragma: no cover
+    np = None  # type: ignore[assignment]
+    _HAS_NUMPY = False
+
+# Minimum number of symbols before parallel processing overhead is worth it
+_PARALLEL_THRESHOLD = 4
 
 DEFAULT_CODE_KEYWORDS = (
     "trade",
@@ -107,53 +119,62 @@ def _feature_vector(rows: Sequence[PriceRow], index: int, lookback: int = 5) -> 
     return [avg_ret, vol, momentum, vol_spike]
 
 
+def _score_symbol(args: tuple) -> Optional[dict]:
+    """Score a single symbol for screening.  Module-level so it is picklable."""
+    symbol, rows, min_avg_volume, min_price = args
+    if len(rows) < 30:
+        return None
+    closes = [r.close for r in rows]
+    vols = [r.volume for r in rows]
+    avg_volume = mean(vols[-20:])
+    latest = closes[-1]
+    if avg_volume < min_avg_volume or latest < min_price:
+        return None
+    rets = _daily_returns(closes[-90:])
+    if len(rets) < 20:
+        return None
+    annual_ret = mean(rets) * 252
+    annual_vol = (pstdev(rets) if len(rets) > 1 else 0.0) * math.sqrt(252)
+    sharpe = annual_ret / annual_vol if annual_vol > 0 else 0.0
+    momentum = (closes[-1] / closes[-21]) - 1.0
+    ensemble = build_latest_ensemble_snapshot(rows)
+    score = (
+        (0.45 * sharpe)
+        + (0.35 * annual_ret)
+        + (0.20 * momentum)
+        + (0.20 * (ensemble["ensemble_probability"] - 0.5))
+        + (0.10 * (ensemble["technical_probability"] - 0.5))
+    )
+    return {
+        "symbol": symbol,
+        "score": score,
+        "annual_return": annual_ret,
+        "annual_volatility": annual_vol,
+        "sharpe": sharpe,
+        "momentum_1m": momentum,
+        "avg_volume_20d": avg_volume,
+        "last_price": latest,
+        "ml_probability": ensemble["ml_probability"],
+        "technical_probability": ensemble["technical_probability"],
+        "ensemble_probability": ensemble["ensemble_probability"],
+        "ensemble_stance": ensemble["stance"],
+    }
+
+
 def screen_symbols(
     grouped: Dict[str, List[PriceRow]],
     min_avg_volume: float = 100_000,
     min_price: float = 5.0,
     top_n: int = 10,
+    workers: Optional[int] = None,
 ) -> List[dict]:
-    rankings: List[dict] = []
-    for symbol, rows in grouped.items():
-        if len(rows) < 30:
-            continue
-        closes = [r.close for r in rows]
-        vols = [r.volume for r in rows]
-        avg_volume = mean(vols[-20:])
-        latest = closes[-1]
-        if avg_volume < min_avg_volume or latest < min_price:
-            continue
-        rets = _daily_returns(closes[-90:])
-        if len(rets) < 20:
-            continue
-        annual_ret = mean(rets) * 252
-        annual_vol = (pstdev(rets) if len(rets) > 1 else 0.0) * math.sqrt(252)
-        sharpe = annual_ret / annual_vol if annual_vol > 0 else 0.0
-        momentum = (closes[-1] / closes[-21]) - 1.0
-        ensemble = build_latest_ensemble_snapshot(rows)
-        score = (
-            (0.45 * sharpe)
-            + (0.35 * annual_ret)
-            + (0.20 * momentum)
-            + (0.20 * (ensemble["ensemble_probability"] - 0.5))
-            + (0.10 * (ensemble["technical_probability"] - 0.5))
-        )
-        rankings.append(
-            {
-                "symbol": symbol,
-                "score": score,
-                "annual_return": annual_ret,
-                "annual_volatility": annual_vol,
-                "sharpe": sharpe,
-                "momentum_1m": momentum,
-                "avg_volume_20d": avg_volume,
-                "last_price": latest,
-                "ml_probability": ensemble["ml_probability"],
-                "technical_probability": ensemble["technical_probability"],
-                "ensemble_probability": ensemble["ensemble_probability"],
-                "ensemble_stance": ensemble["stance"],
-            }
-        )
+    args = [(sym, rows, min_avg_volume, min_price) for sym, rows in grouped.items()]
+    if len(args) >= _PARALLEL_THRESHOLD and workers != 1:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            results: Iterable[Optional[dict]] = executor.map(_score_symbol, args)
+    else:
+        results = (_score_symbol(a) for a in args)
+    rankings = [r for r in results if r is not None]
     rankings.sort(key=lambda x: x["score"], reverse=True)
     return rankings[:top_n]
 
@@ -197,6 +218,35 @@ class LogisticSignalModel:
     def fit(self, X: Sequence[Sequence[float]], y: Sequence[int]) -> None:
         if not X or len(X) != len(y):
             raise ValueError("Training data is invalid")
+        if _HAS_NUMPY:
+            self._fit_numpy(X, y)
+        else:
+            self._fit_python(X, y)
+
+    def _fit_numpy(self, X: Sequence[Sequence[float]], y: Sequence[int]) -> None:
+        # Vectorised gradient descent — releases the GIL for BLAS/NEON kernels.
+        Xa = np.array(X, dtype=np.float64)
+        means = Xa.mean(axis=0)
+        stds = Xa.std(axis=0)
+        stds[stds == 0] = 1.0
+        self._means = means.tolist()
+        self._stds = stds.tolist()
+        Xn = (Xa - means) / stds
+        ya = np.array(y, dtype=np.float64)
+        w = np.zeros(Xn.shape[1], dtype=np.float64)
+        b = 0.0
+        lr = self.learning_rate
+        n = float(len(Xn))
+        for _ in range(self.epochs):
+            z = np.clip(Xn @ w + b, -30.0, 30.0)
+            pred = 1.0 / (1.0 + np.exp(-z))
+            err = pred - ya
+            w -= lr * (Xn.T @ err / n)
+            b -= lr * float(err.sum() / n)
+        self._weights = w.tolist()
+        self._bias = float(b)
+
+    def _fit_python(self, X: Sequence[Sequence[float]], y: Sequence[int]) -> None:
         Xn = self._standardize(X, fit=True)
         cols = len(Xn[0])
         self._weights = [0.0] * cols
@@ -218,8 +268,16 @@ class LogisticSignalModel:
     def predict_proba(self, X: Sequence[Sequence[float]]) -> List[float]:
         if not self._weights:
             raise ValueError("Model is not fitted")
+        if _HAS_NUMPY:
+            return self._predict_proba_numpy(X)
         Xn = self._standardize(X, fit=False)
         return [self._sigmoid(sum(w * x for w, x in zip(self._weights, row)) + self._bias) for row in Xn]
+
+    def _predict_proba_numpy(self, X: Sequence[Sequence[float]]) -> List[float]:
+        Xa = np.array(X, dtype=np.float64)
+        Xn = (Xa - np.array(self._means)) / np.array(self._stds)
+        z = np.clip(Xn @ np.array(self._weights) + self._bias, -30.0, 30.0)
+        return (1.0 / (1.0 + np.exp(-z))).tolist()
 
 
 def _technical_engine_scores(rows: Sequence[PriceRow], index: int) -> Dict[str, float]:
@@ -308,7 +366,7 @@ def build_latest_ensemble_snapshot(rows: Sequence[PriceRow]) -> dict:
     ml_probability = 0.5
     X, y = build_features(rows)
     if feature_vector and len(X) >= 10:
-        model = LogisticSignalModel(epochs=300)
+        model = LogisticSignalModel(epochs=100)
         model.fit(X, y)
         ml_probability = model.predict_proba([feature_vector])[0]
     return build_ensemble_snapshot(rows, len(rows) - 1, ml_probability)
@@ -463,10 +521,11 @@ def run_pipeline(
     min_avg_volume: float = 100_000,
     min_price: float = 5.0,
     top_n: int = 10,
+    workers: Optional[int] = None,
 ) -> dict:
     rows = load_price_csv(csv_path)
     grouped = group_by_symbol(rows)
-    rankings = screen_symbols(grouped, min_avg_volume=min_avg_volume, min_price=min_price, top_n=top_n)
+    rankings = screen_symbols(grouped, min_avg_volume=min_avg_volume, min_price=min_price, top_n=top_n, workers=workers)
     allocations = recommend_allocations(rankings)
 
     target_symbol = symbol or (rankings[0]["symbol"] if rankings else None)
@@ -684,6 +743,13 @@ def _analyze_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     p.add_argument("--min-avg-volume", type=float, default=100_000)
     p.add_argument("--min-price", type=float, default=5.0)
     p.add_argument("--top-n", type=int, default=10)
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Parallel worker processes for screening (default: auto-detect CPU count)",
+    )
 
 
 def _assemble_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -701,6 +767,13 @@ def _daily_report_parser(subparsers: argparse._SubParsersAction[argparse.Argumen
     p.add_argument("--scan-root", help="Optional repository root for assembly scan")
     p.add_argument("--repo-name-contains", action="append", default=[], help="Optional repository name filter")
     p.add_argument("--output", help="Optional JSON output path")
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Parallel worker processes for screening (default: auto-detect CPU count)",
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -726,6 +799,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             min_avg_volume=getattr(args, "min_avg_volume", 100_000),
             min_price=getattr(args, "min_price", 5.0),
             top_n=getattr(args, "top_n", 10),
+            workers=getattr(args, "workers", None),
         )
         print(json.dumps(result, indent=2, default=str))
         return 0
@@ -742,7 +816,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 0
 
     if args.command == "daily-report":
-        result = run_pipeline(csv_path=args.csv, symbol=args.symbol)
+        result = run_pipeline(csv_path=args.csv, symbol=args.symbol, workers=getattr(args, "workers", None))
         if args.scan_root:
             result["assembly"] = assemble_codebase(args.scan_root, args.repo_name_contains)
         if args.output:
