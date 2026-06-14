@@ -4,7 +4,6 @@ import argparse
 import csv
 import json
 import math
-import os
 import re
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -168,6 +167,8 @@ def screen_symbols(
     top_n: int = 10,
     workers: Optional[int] = None,
 ) -> List[dict]:
+    if workers is not None and workers < 1:
+        raise ValueError("workers must be None or at least 1")
     args = [(sym, rows, min_avg_volume, min_price) for sym, rows in grouped.items()]
     if len(args) >= _PARALLEL_THRESHOLD and workers != 1:
         with ProcessPoolExecutor(max_workers=workers) as executor:
